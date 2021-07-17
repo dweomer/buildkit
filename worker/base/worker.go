@@ -42,14 +42,15 @@ import (
 	"github.com/moby/buildkit/source/http"
 	"github.com/moby/buildkit/source/local"
 	"github.com/moby/buildkit/util/archutil"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/controller"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	bolt "go.etcd.io/bbolt"
+	"golang.org/x/sync/semaphore"
 )
 
 const labelCreatedAt = "buildkit/createdat"
@@ -74,6 +75,7 @@ type WorkerOpt struct {
 	IdentityMapping *idtools.IdentityMapping
 	LeaseManager    leases.Manager
 	GarbageCollect  func(context.Context) (gc.Stats, error)
+	ParallelismSem  *semaphore.Weighted
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
@@ -87,7 +89,7 @@ type Worker struct {
 }
 
 // NewWorker instantiates a local worker
-func NewWorker(opt WorkerOpt) (*Worker, error) {
+func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 	imageRefChecker := imagerefchecker.New(imagerefchecker.Opt{
 		ImageStore:   opt.ImageStore,
 		ContentStore: opt.ContentStore,
@@ -137,7 +139,7 @@ func NewWorker(opt WorkerOpt) (*Worker, error) {
 		}
 		sm.Register(gs)
 	} else {
-		logrus.Warnf("git source cannot be enabled: %v", err)
+		bklog.G(ctx).Warnf("git source cannot be enabled: %v", err)
 	}
 
 	hs, err := http.NewSource(http.Opt{
@@ -169,12 +171,12 @@ func NewWorker(opt WorkerOpt) (*Worker, error) {
 		return nil, err
 	}
 
-	leases, err := opt.LeaseManager.List(context.TODO(), "labels.\"buildkit/lease.temporary\"")
+	leases, err := opt.LeaseManager.List(ctx, "labels.\"buildkit/lease.temporary\"")
 	if err != nil {
 		return nil, err
 	}
 	for _, l := range leases {
-		opt.LeaseManager.Delete(context.TODO(), l)
+		opt.LeaseManager.Delete(ctx, l)
 	}
 
 	return &Worker{
@@ -261,11 +263,11 @@ func (w *Worker) ResolveOp(v solver.Vertex, s frontend.FrontendLLBBridge, sm *se
 	if baseOp, ok := v.Sys().(*pb.Op); ok {
 		switch op := baseOp.Op.(type) {
 		case *pb.Op_Source:
-			return ops.NewSourceOp(v, op, baseOp.Platform, w.SourceManager, sm, w)
+			return ops.NewSourceOp(v, op, baseOp.Platform, w.SourceManager, w.ParallelismSem, sm, w)
 		case *pb.Op_Exec:
-			return ops.NewExecOp(v, op, baseOp.Platform, w.CacheMgr, sm, w.WorkerOpt.MetadataStore, w.WorkerOpt.Executor, w)
+			return ops.NewExecOp(v, op, baseOp.Platform, w.CacheMgr, w.ParallelismSem, sm, w.WorkerOpt.MetadataStore, w.WorkerOpt.Executor, w)
 		case *pb.Op_File:
-			return ops.NewFileOp(v, op, w.CacheMgr, w.WorkerOpt.MetadataStore, w)
+			return ops.NewFileOp(v, op, w.CacheMgr, w.ParallelismSem, w.WorkerOpt.MetadataStore, w)
 		case *pb.Op_Build:
 			return ops.NewBuildOp(v, op, s, w)
 		default:
@@ -371,10 +373,11 @@ func (w *Worker) Exporter(name string, sm *session.Manager) (exporter.Exporter, 
 }
 
 func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (ref cache.ImmutableRef, err error) {
-	pw, _, _ := progress.FromContext(ctx)
 	descHandler := &cache.DescHandler{
 		Provider: func(session.Group) content.Provider { return remote.Provider },
-		Progress: &controller.Controller{Writer: pw},
+		Progress: &controller.Controller{
+			WriterFactory: progress.FromContext(ctx),
+		},
 	}
 	descHandlers := cache.DescHandlers(make(map[digest.Digest]*cache.DescHandler))
 	for _, desc := range remote.Descriptors {

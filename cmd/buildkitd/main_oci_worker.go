@@ -4,23 +4,26 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/pkg/dialer"
+	"github.com/containerd/containerd/pkg/userns"
+	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes/docker"
 	ctdsnapshot "github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/native"
 	"github.com/containerd/containerd/snapshots/overlay"
 	"github.com/containerd/containerd/snapshots/overlay/overlayutils"
 	snproxy "github.com/containerd/containerd/snapshots/proxy"
-	"github.com/containerd/containerd/sys"
 	fuseoverlayfs "github.com/containerd/fuse-overlayfs-snapshotter"
 	sgzfs "github.com/containerd/stargz-snapshotter/fs"
 	sgzconf "github.com/containerd/stargz-snapshotter/fs/config"
@@ -28,14 +31,17 @@ import (
 	remotesn "github.com/containerd/stargz-snapshotter/snapshot"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/executor/oci"
+	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/network/cniprovider"
 	"github.com/moby/buildkit/util/network/netproviders"
+	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/runc"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 )
@@ -104,7 +110,7 @@ func init() {
 	}
 	n := "oci-worker-rootless"
 	u := "enable rootless mode"
-	if sys.RunningInUserNS() {
+	if userns.RunningInUserNS() {
 		flags = append(flags, cli.BoolTFlag{
 			Name:  n,
 			Usage: u,
@@ -183,7 +189,7 @@ func applyOCIFlags(c *cli.Context, cfg *config.Config) error {
 		cfg.Workers.OCI.Rootless = c.GlobalBool("rootless")
 	}
 	if c.GlobalIsSet("oci-worker-rootless") {
-		if !sys.RunningInUserNS() || os.Geteuid() > 0 {
+		if !userns.RunningInUserNS() || os.Geteuid() > 0 {
 			return errors.New("rootless mode requires to be executed as the mapped root in a user namespace; you may use RootlessKit for setting up the namespace")
 		}
 		cfg.Workers.OCI.Rootless = c.GlobalBool("oci-worker-rootless")
@@ -244,7 +250,7 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 	}
 
 	hosts := resolverFunc(common.config)
-	snFactory, err := snapshotterFactory(common.config.Root, cfg, hosts, common.configMetaData)
+	snFactory, err := snapshotterFactory(common.config.Root, cfg, common.sessionManager, hosts, common.configMetaData)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +282,12 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		},
 	}
 
-	opt, err := runc.NewWorkerOpt(common.config.Root, snFactory, cfg.Rootless, processMode, cfg.Labels, idmapping, nc, dns, cfg.Binary, cfg.ApparmorProfile)
+	var parallelismSem *semaphore.Weighted
+	if cfg.MaxParallelism > 0 {
+		parallelismSem = semaphore.NewWeighted(int64(cfg.MaxParallelism))
+	}
+
+	opt, err := runc.NewWorkerOpt(common.config.Root, snFactory, cfg.Rootless, processMode, cfg.Labels, idmapping, nc, dns, cfg.Binary, cfg.ApparmorProfile, parallelismSem, common.traceSocket)
 	if err != nil {
 		return nil, err
 	}
@@ -290,14 +301,14 @@ func ociWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker
 		}
 		opt.Platforms = platforms
 	}
-	w, err := base.NewWorker(opt)
+	w, err := base.NewWorker(context.TODO(), opt)
 	if err != nil {
 		return nil, err
 	}
 	return []worker.Worker{w}, nil
 }
 
-func snapshotterFactory(commonRoot string, cfg config.OCIConfig, hosts docker.RegistryHosts, cfgMeta *toml.MetaData) (runc.SnapshotterFactory, error) {
+func snapshotterFactory(commonRoot string, cfg config.OCIConfig, sm *session.Manager, hosts docker.RegistryHosts, cfgMeta *toml.MetaData) (runc.SnapshotterFactory, error) {
 	var (
 		name    = cfg.Snapshotter
 		address = cfg.ProxySnapshotterPath
@@ -362,22 +373,6 @@ func snapshotterFactory(commonRoot string, cfg config.OCIConfig, hosts docker.Re
 			return fuseoverlayfs.NewSnapshotter(root)
 		}
 	case "stargz":
-		// Pass the registry configuration to stargz snapshotter
-		sgzhosts := func(host string) ([]docker.RegistryHost, error) {
-			base, err := hosts(host)
-			if err != nil {
-				return nil, err
-			}
-			for i := range base {
-				if base[i].Authorizer == nil {
-					// Default authorizer that don't fetch creds via session
-					// TODO(ktock): use session-based authorizer
-					base[i].Authorizer = docker.NewDockerAuthorizer(
-						docker.WithAuthClient(base[i].Client))
-				}
-			}
-			return base, nil
-		}
 		sgzCfg := sgzconf.Config{}
 		if cfgMeta != nil {
 			if err := cfgMeta.PrimitiveDecode(cfg.StargzSnapshotterConfig, &sgzCfg); err != nil {
@@ -387,11 +382,8 @@ func snapshotterFactory(commonRoot string, cfg config.OCIConfig, hosts docker.Re
 		snFactory.New = func(root string) (ctdsnapshot.Snapshotter, error) {
 			fs, err := sgzfs.NewFilesystem(filepath.Join(root, "stargz"),
 				sgzCfg,
-				sgzfs.WithGetSources(
-					// provides source info based on the registry config and
-					// default labels.
-					sgzsource.FromDefaultLabels(sgzhosts),
-				),
+				// Source info based on the buildkit's registry config and session
+				sgzfs.WithGetSources(sourceWithSession(hosts, sm)),
 			)
 			if err != nil {
 				return nil, err
@@ -414,4 +406,75 @@ func validOCIBinary() bool {
 		return false
 	}
 	return true
+}
+
+const (
+	// targetRefLabel is a label which contains image reference.
+	targetRefLabel = "containerd.io/snapshot/remote/stargz.reference"
+
+	// targetDigestLabel is a label which contains layer digest.
+	targetDigestLabel = "containerd.io/snapshot/remote/stargz.digest"
+
+	// targetImageLayersLabel is a label which contains layer digests contained in
+	// the target image.
+	targetImageLayersLabel = "containerd.io/snapshot/remote/stargz.layers"
+
+	// targetSessionLabel is a labeld which contains session IDs usable for
+	// authenticating the target snapshot.
+	targetSessionLabel = "containerd.io/snapshot/remote/stargz.session"
+)
+
+// sourceWithSession returns a callback which implements a converter from labels to the
+// typed snapshot source info. This callback is called everytime the snapshotter resolves a
+// snapshot. This callback returns configuration that is based on buildkitd's registry config
+// and utilizes the session-based authorizer.
+func sourceWithSession(hosts docker.RegistryHosts, sm *session.Manager) sgzsource.GetSources {
+	return func(labels map[string]string) (src []sgzsource.Source, err error) {
+		// labels contains multiple source candidates with unique IDs appended on each call
+		// to the snapshotter API. So, first, get all these IDs
+		var ids []string
+		for k := range labels {
+			if strings.HasPrefix(k, targetRefLabel+".") {
+				ids = append(ids, strings.TrimPrefix(k, targetRefLabel+"."))
+			}
+		}
+
+		// Parse all labels
+		for _, id := range ids {
+			// Parse session labels
+			ref, ok := labels[targetRefLabel+"."+id]
+			if !ok {
+				continue
+			}
+			named, err := reference.Parse(ref)
+			if err != nil {
+				continue
+			}
+			var sids []string
+			for i := 0; ; i++ {
+				sidKey := targetSessionLabel + "." + fmt.Sprintf("%d", i) + "." + id
+				sid, ok := labels[sidKey]
+				if !ok {
+					break
+				}
+				sids = append(sids, sid)
+			}
+
+			// Get source information based on labels and RegistryHosts containing
+			// session-based authorizer.
+			parse := sgzsource.FromDefaultLabels(func(ref reference.Spec) ([]docker.RegistryHost, error) {
+				return resolver.DefaultPool.GetResolver(hosts, named.String(), "pull", sm, session.NewGroup(sids...)).
+					HostsFunc(ref.Hostname())
+			})
+			if s, err := parse(map[string]string{
+				targetRefLabel:         ref,
+				targetDigestLabel:      labels[targetDigestLabel+"."+id],
+				targetImageLayersLabel: labels[targetImageLayersLabel+"."+id],
+			}); err == nil {
+				src = append(src, s...)
+			}
+		}
+
+		return src, nil
+	}
 }

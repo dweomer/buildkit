@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/moby/buildkit/util/bklog"
+
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/mount"
@@ -26,7 +28,6 @@ import (
 	"github.com/moby/buildkit/util/network"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 type containerdExecutor struct {
@@ -38,10 +39,11 @@ type containerdExecutor struct {
 	running          map[string]chan error
 	mu               sync.Mutex
 	apparmorProfile  string
+	traceSocket      string
 }
 
 // New creates a new executor backed by connection to containerd API
-func New(client *containerd.Client, root, cgroup string, networkProviders map[pb.NetMode]network.Provider, dnsConfig *oci.DNSConfig, apparmorProfile string) executor.Executor {
+func New(client *containerd.Client, root, cgroup string, networkProviders map[pb.NetMode]network.Provider, dnsConfig *oci.DNSConfig, apparmorProfile string, traceSocket string) executor.Executor {
 	// clean up old hosts/resolv.conf file. ignore errors
 	os.RemoveAll(filepath.Join(root, "hosts"))
 	os.RemoveAll(filepath.Join(root, "resolv.conf"))
@@ -54,6 +56,7 @@ func New(client *containerd.Client, root, cgroup string, networkProviders map[pb
 		dnsConfig:        dnsConfig,
 		running:          make(map[string]chan error),
 		apparmorProfile:  apparmorProfile,
+		traceSocket:      traceSocket,
 	}
 }
 
@@ -151,7 +154,7 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 	defer namespace.Close()
 
 	if meta.NetMode == pb.NetMode_HOST {
-		logrus.Info("enabling HostNetworking")
+		bklog.G(ctx).Info("enabling HostNetworking")
 	}
 
 	opts := []containerdoci.SpecOpts{oci.WithUIDGID(uid, gid, sgids)}
@@ -170,7 +173,7 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 		opts = append(opts, containerdoci.WithCgroup(cgroupsPath))
 	}
 	processMode := oci.ProcessSandbox // FIXME(AkihiroSuda)
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, processMode, nil, w.apparmorProfile, opts...)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, processMode, nil, w.apparmorProfile, w.traceSocket, opts...)
 	if err != nil {
 		return err
 	}
@@ -330,6 +333,12 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Proces
 		return err
 	}
 
+	io := p.IO()
+	defer func() {
+		io.Wait()
+		io.Close()
+	}()
+
 	err = p.Start(ctx)
 	if err != nil {
 		return err
@@ -356,7 +365,7 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Proces
 				}
 				err = p.Resize(resizeCtx, size.Cols, size.Rows)
 				if err != nil {
-					logrus.Warnf("Failed to resize %s: %s", p.ID(), err)
+					bklog.G(resizeCtx).Warnf("Failed to resize %s: %s", p.ID(), err)
 				}
 			}
 		}
@@ -373,6 +382,7 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Proces
 			killCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 			killCtxDone = killCtx.Done()
 			p.Kill(killCtx, syscall.SIGKILL)
+			io.Cancel()
 		case status := <-statusCh:
 			if cancel != nil {
 				cancel()
@@ -397,6 +407,7 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p containerd.Proces
 			if cancel != nil {
 				cancel()
 			}
+			io.Cancel()
 			return errors.Errorf("failed to kill process on cancel")
 		}
 	}

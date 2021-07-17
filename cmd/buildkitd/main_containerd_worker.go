@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -225,11 +227,16 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 		},
 	}
 
+	var parallelismSem *semaphore.Weighted
+	if cfg.MaxParallelism > 0 {
+		parallelismSem = semaphore.NewWeighted(int64(cfg.MaxParallelism))
+	}
+
 	snapshotter := ctd.DefaultSnapshotter
 	if cfg.Snapshotter != "" {
 		snapshotter = cfg.Snapshotter
 	}
-	opt, err := containerd.NewWorkerOpt(common.config.Root, cfg.Address, snapshotter, cfg.Namespace, cfg.Labels, dns, nc, common.config.Workers.Containerd.ApparmorProfile, ctd.WithTimeout(60*time.Second))
+	opt, err := containerd.NewWorkerOpt(common.config.Root, cfg.Address, snapshotter, cfg.Namespace, cfg.Labels, dns, nc, common.config.Workers.Containerd.ApparmorProfile, parallelismSem, common.traceSocket, ctd.WithTimeout(60*time.Second))
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +250,7 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 		}
 		opt.Platforms = platforms
 	}
-	w, err := base.NewWorker(opt)
+	w, err := base.NewWorker(context.TODO(), opt)
 	if err != nil {
 		return nil, err
 	}

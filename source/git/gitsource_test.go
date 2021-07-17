@@ -323,6 +323,107 @@ func testMultipleRepos(t *testing.T, keepGitDir bool) {
 	require.Equal(t, "xyz\n", string(dt))
 }
 
+func TestCredentialRedaction(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir, err := ioutil.TempDir("", "buildkit-state")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	gs := setupGitSource(t, tmpdir)
+
+	url := "https://user:keepthissecret@non-existant-host/user/private-repo.git"
+	id := &source.GitIdentifier{Remote: url}
+
+	g, err := gs.Resolve(ctx, id, nil, nil)
+	require.NoError(t, err)
+
+	_, _, _, err = g.CacheKey(ctx, nil, 0)
+	require.Error(t, err)
+	require.False(t, strings.Contains(err.Error(), "keepthissecret"))
+}
+
+func TestSubdir(t *testing.T) {
+	testSubdir(t, false)
+}
+func TestSubdirKeepGitDir(t *testing.T) {
+	testSubdir(t, true)
+}
+
+func testSubdir(t *testing.T, keepGitDir bool) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := context.TODO()
+
+	tmpdir, err := ioutil.TempDir("", "buildkit-state")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	gs := setupGitSource(t, tmpdir)
+
+	repodir, err := ioutil.TempDir("", "buildkit-gitsource")
+	require.NoError(t, err)
+	defer os.RemoveAll(repodir)
+
+	err = runShell(repodir,
+		"git init",
+		"git config --local user.email test",
+		"git config --local user.name test",
+		"echo foo > abc",
+		"mkdir sub",
+		"echo abc > sub/bar",
+		"git add abc sub",
+		"git commit -m initial",
+	)
+	require.NoError(t, err)
+
+	id := &source.GitIdentifier{Remote: repodir, KeepGitDir: keepGitDir, Subdir: "sub"}
+
+	g, err := gs.Resolve(ctx, id, nil, nil)
+	require.NoError(t, err)
+
+	key1, _, done, err := g.CacheKey(ctx, nil, 0)
+	require.NoError(t, err)
+	require.True(t, done)
+
+	expLen := 44
+	if keepGitDir {
+		expLen += 4
+	}
+
+	require.Equal(t, expLen, len(key1))
+
+	ref1, err := g.Snapshot(ctx, nil)
+	require.NoError(t, err)
+	defer ref1.Release(context.TODO())
+
+	mount, err := ref1.Mount(ctx, false, nil)
+	require.NoError(t, err)
+
+	lm := snapshot.LocalMounter(mount)
+	dir, err := lm.Mount()
+	require.NoError(t, err)
+	defer lm.Unmount()
+
+	fis, err := ioutil.ReadDir(dir)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, len(fis))
+
+	dt, err := ioutil.ReadFile(filepath.Join(dir, "bar"))
+	require.NoError(t, err)
+
+	require.Equal(t, "abc\n", string(dt))
+}
+
 func setupGitSource(t *testing.T, tmpdir string) source.Source {
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	assert.NoError(t, err)
@@ -397,6 +498,7 @@ func setupGitRepo(dir string) (string, error) {
 		"git submodule add "+subPath+" sub",
 		"git add -A",
 		"git commit -m withsub",
+		"git checkout master",
 	); err != nil {
 		return "", err
 	}
@@ -412,6 +514,7 @@ func runShell(dir string, cmds ...string) error {
 			cmd = exec.Command("sh", "-c", args)
 		}
 		cmd.Dir = dir
+		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return errors.Wrapf(err, "error running %v", args)
 		}

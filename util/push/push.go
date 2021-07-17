@@ -11,16 +11,15 @@ import (
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/docker/distribution/reference"
-	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/moby/buildkit/util/resolver"
+	"github.com/moby/buildkit/util/resolver/limited"
 	"github.com/moby/buildkit/util/resolver/retryhandler"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -55,7 +54,7 @@ func Push(ctx context.Context, sm *session.Manager, sid string, provider content
 	if insecure {
 		insecureTrue := true
 		httpTrue := true
-		hosts = resolver.NewRegistryConfig(map[string]config.RegistryConfig{
+		hosts = resolver.NewRegistryConfig(map[string]resolver.RegistryConfig{
 			reference.Domain(parsed): {
 				Insecure:  &insecureTrue,
 				PlainHTTP: &httpTrue,
@@ -87,7 +86,7 @@ func Push(ctx context.Context, sm *session.Manager, sid string, provider content
 		}
 	})
 
-	pushHandler := retryhandler.New(remotes.PushHandler(pusher, provider), logs.LoggerFromContext(ctx))
+	pushHandler := retryhandler.New(limited.PushHandler(pusher, provider, ref), logs.LoggerFromContext(ctx))
 	pushUpdateSourceHandler, err := updateDistributionSourceHandler(manager, pushHandler, ref)
 	if err != nil {
 		return err
@@ -184,7 +183,7 @@ func annotateDistributionSourceHandler(manager content.Manager, annotations map[
 }
 
 func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.FromContext(ctx)
+	pw, _, _ := progress.NewFromContext(ctx)
 	now := time.Now()
 	st := progress.Status{
 		Started: &now,

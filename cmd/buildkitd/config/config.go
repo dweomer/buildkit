@@ -1,6 +1,9 @@
 package config
 
-import "github.com/BurntSushi/toml"
+import (
+	"github.com/BurntSushi/toml"
+	"github.com/moby/buildkit/util/resolver"
+)
 
 // Config provides containerd configuration data for the server
 type Config struct {
@@ -9,7 +12,7 @@ type Config struct {
 	// Root is the path to a directory where buildkit will store persistent data
 	Root string `toml:"root"`
 
-	//Entitlements e.g. security.insecure, network.host
+	// Entitlements e.g. security.insecure, network.host
 	Entitlements []string `toml:"insecure-entitlements"`
 	// GRPC configuration settings
 	GRPC GRPCConfig `toml:"grpc"`
@@ -19,7 +22,7 @@ type Config struct {
 		Containerd ContainerdConfig `toml:"containerd"`
 	} `toml:"worker"`
 
-	Registries map[string]RegistryConfig `toml:"registry"`
+	Registries map[string]resolver.RegistryConfig `toml:"registry"`
 
 	DNS *DNSConfig `toml:"dns"`
 }
@@ -33,20 +36,6 @@ type GRPCConfig struct {
 	TLS TLSConfig `toml:"tls"`
 	// MaxRecvMsgSize int    `toml:"max_recv_message_size"`
 	// MaxSendMsgSize int    `toml:"max_send_message_size"`
-}
-
-type RegistryConfig struct {
-	Mirrors      []string     `toml:"mirrors"`
-	PlainHTTP    *bool        `toml:"http"`
-	Insecure     *bool        `toml:"insecure"`
-	RootCAs      []string     `toml:"ca"`
-	KeyPairs     []TLSKeyPair `toml:"keypair"`
-	TLSConfigDir []string     `toml:"tlsconfigdir"`
-}
-
-type TLSKeyPair struct {
-	Key         string `toml:"key"`
-	Certificate string `toml:"cert"`
 }
 
 type TLSConfig struct {
@@ -91,6 +80,9 @@ type OCIConfig struct {
 	// ApparmorProfile is the name of the apparmor profile that should be used to constrain build containers.
 	// The profile should already be loaded (by a higher level system) before creating a worker.
 	ApparmorProfile string `toml:"apparmor-profile"`
+
+	// MaxParallelism is the maximum number of parallel build steps that can be run at the same time.
+	MaxParallelism int `toml:"max-parallelism"`
 }
 
 type ContainerdConfig struct {
@@ -106,6 +98,8 @@ type ContainerdConfig struct {
 	// ApparmorProfile is the name of the apparmor profile that should be used to constrain build containers.
 	// The profile should already be loaded (by a higher level system) before creating a worker.
 	ApparmorProfile string `toml:"apparmor-profile"`
+
+	MaxParallelism int `toml:"max-parallelism"`
 }
 
 type GCPolicy struct {

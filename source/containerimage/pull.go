@@ -173,6 +173,10 @@ func mainManifestKey(ctx context.Context, desc specs.Descriptor, platform specs.
 func (p *puller) CacheKey(ctx context.Context, g session.Group, index int) (cacheKey string, cacheOpts solver.CacheOpts, cacheDone bool, err error) {
 	p.Puller.Resolver = resolver.DefaultPool.GetResolver(p.RegistryHosts, p.Ref, "pull", p.SessionManager, g).WithImageStore(p.ImageStore, p.id.ResolveMode)
 
+	// progressFactory needs the outer context, the context in `p.g.Do` will
+	// be canceled before the progress output is complete
+	progressFactory := progress.FromContext(ctx)
+
 	_, err = p.g.Do(ctx, "", func(ctx context.Context) (_ interface{}, err error) {
 		if p.cacheKeyErr != nil || p.cacheKeyDone == true {
 			return nil, p.cacheKeyErr
@@ -200,9 +204,8 @@ func (p *puller) CacheKey(ctx context.Context, g session.Group, index int) (cach
 		}
 
 		if len(p.manifest.Descriptors) > 0 {
-			pw, _, _ := progress.FromContext(ctx)
 			progressController := &controller.Controller{
-				Writer: pw,
+				WriterFactory: progressFactory,
 			}
 			if p.vtx != nil {
 				progressController.Digest = p.vtx.Digest()
@@ -238,6 +241,7 @@ func (p *puller) CacheKey(ctx context.Context, g session.Group, index int) (cach
 					Provider:       p.manifest.Provider,
 					Progress:       progressController,
 					SnapshotLabels: labels,
+					Ref:            p.manifest.Ref,
 				}
 			}
 		}
@@ -369,7 +373,7 @@ func cacheKeyFromConfig(dt []byte) digest.Digest {
 }
 
 func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.FromContext(ctx)
+	pw, _, _ := progress.NewFromContext(ctx)
 	now := time.Now()
 	st := progress.Status{
 		Started: &now,

@@ -465,7 +465,6 @@ func (s *store) Writer(ctx context.Context, opts ...content.WriterOpt) (content.
 	}
 	var lockErr error
 	for count := uint64(0); count < 10; count++ {
-		time.Sleep(time.Millisecond * time.Duration(rand.Intn(1<<count)))
 		if err := tryLock(wOpts.Ref); err != nil {
 			if !errdefs.IsUnavailable(err) {
 				return nil, err
@@ -476,6 +475,7 @@ func (s *store) Writer(ctx context.Context, opts ...content.WriterOpt) (content.
 			lockErr = nil
 			break
 		}
+		time.Sleep(time.Millisecond * time.Duration(rand.Intn(1<<count)))
 	}
 
 	if lockErr != nil {
@@ -500,7 +500,7 @@ func (s *store) resumeStatus(ref string, total int64, digester digest.Digester) 
 	if ref != status.Ref {
 		// NOTE(stevvooe): This is fairly catastrophic. Either we have some
 		// layout corruption or a hash collision for the ref key.
-		return status, errors.Wrapf(err, "ref key does not match: %v != %v", ref, status.Ref)
+		return status, errors.Errorf("ref key does not match: %v != %v", ref, status.Ref)
 	}
 
 	if total > 0 && status.Total > 0 && total != status.Total {
