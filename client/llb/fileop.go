@@ -5,6 +5,7 @@ import (
 	_ "crypto/sha256" // for opencontainers/go-digest
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -80,6 +81,13 @@ func (fa *FileAction) Mkdir(p string, m os.FileMode, opt ...MkdirOption) *FileAc
 
 func (fa *FileAction) Mkfile(p string, m os.FileMode, dt []byte, opt ...MkfileOption) *FileAction {
 	a := Mkfile(p, m, dt, opt...)
+	a.prev = fa
+	return a
+}
+
+// Symlink creates a symlink at `newpath` that points to `oldpath`
+func (fa *FileAction) Symlink(oldpath, newpath string, opt ...SymlinkOption) *FileAction {
+	a := Symlink(oldpath, newpath, opt...)
 	a.prev = fa
 	return a
 }
@@ -192,6 +200,7 @@ type ChownOption interface {
 	MkdirOption
 	MkfileOption
 	CopyOption
+	SymlinkOption
 }
 
 type mkdirOptionFunc func(*MkdirInfo)
@@ -289,6 +298,10 @@ func (co ChownOpt) SetCopyOption(mi *CopyInfo) {
 	mi.ChownOpt = &co
 }
 
+func (co ChownOpt) SetSymlinkOption(si *SymlinkInfo) {
+	si.ChownOpt = &co
+}
+
 func (co *ChownOpt) marshal(base pb.InputIndex) *pb.ChownOpt {
 	if co == nil {
 		return nil
@@ -334,6 +347,57 @@ func Mkfile(p string, m os.FileMode, dt []byte, opts ...MkfileOption) *FileActio
 			info: mi,
 		},
 	}
+}
+
+// SymlinkInfo is the modifiable options used to create symlinks
+type SymlinkInfo struct {
+	ChownOpt    *ChownOpt
+	CreatedTime *time.Time
+}
+
+func (si *SymlinkInfo) SetSymlinkOption(si2 *SymlinkInfo) {
+	*si2 = *si
+}
+
+type SymlinkOption interface {
+	SetSymlinkOption(*SymlinkInfo)
+}
+
+// Symlink creates a symlink at `newpath` that points to `oldpath`
+func Symlink(oldpath, newpath string, opts ...SymlinkOption) *FileAction {
+	var si SymlinkInfo
+	for _, o := range opts {
+		o.SetSymlinkOption(&si)
+	}
+
+	return &FileAction{
+		action: &fileActionSymlink{
+			oldpath: oldpath,
+			newpath: newpath,
+			info:    si,
+		},
+	}
+}
+
+type fileActionSymlink struct {
+	oldpath string
+	newpath string
+	info    SymlinkInfo
+}
+
+func (s *fileActionSymlink) addCaps(f *FileOp) {
+	addCap(&f.constraints, pb.CapFileSymlinkCreate)
+}
+
+func (s *fileActionSymlink) toProtoAction(_ context.Context, _ string, base pb.InputIndex) (pb.IsFileAction, error) {
+	return &pb.FileAction_Symlink{
+		Symlink: &pb.FileActionSymlink{
+			Oldpath:   s.oldpath,
+			Newpath:   s.newpath,
+			Owner:     s.info.ChownOpt.marshal(base),
+			Timestamp: marshalTime(s.info.CreatedTime),
+		},
+	}, nil
 }
 
 type MkfileOption interface {
@@ -563,7 +627,7 @@ func (a *fileActionCopy) toProtoAction(ctx context.Context, parent string, base 
 }
 
 func (a *fileActionCopy) sourcePath(ctx context.Context) (string, error) {
-	p := path.Clean(a.src)
+	p := filepath.ToSlash(path.Clean(a.src))
 	dir := "/"
 	var err error
 	if !path.IsAbs(p) {
@@ -603,6 +667,10 @@ func (c CreatedTime) SetMkdirOption(mi *MkdirInfo) {
 
 func (c CreatedTime) SetMkfileOption(mi *MkfileInfo) {
 	mi.CreatedTime = (*time.Time)(&c)
+}
+
+func (c CreatedTime) SetSymlinkOption(si *SymlinkInfo) {
+	si.CreatedTime = (*time.Time)(&c)
 }
 
 func (c CreatedTime) SetCopyOption(mi *CopyInfo) {
@@ -745,7 +813,10 @@ func (ms *marshalState) add(fa *FileAction, c *Constraints) (*fileActionState, e
 }
 
 func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error) {
-	if dgst, dt, md, srcs, err := f.Load(c); err == nil {
+	cache := f.Acquire()
+	defer cache.Release()
+
+	if dgst, dt, md, srcs, err := cache.Load(c); err == nil {
 		return dgst, dt, md, srcs, nil
 	}
 
@@ -815,7 +886,7 @@ func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
-	return f.Store(dt, md, f.constraints.SourceLocations, c)
+	return cache.Store(dt, md, f.constraints.SourceLocations, c)
 }
 
 func normalizePath(parent, p string, keepSlash bool) string {
