@@ -36,18 +36,24 @@ func buildPlatformOpt(opt *ConvertOpt) *platformOpt {
 	}
 }
 
-func platformArgs(po *platformOpt, overrides map[string]string) *llb.EnvList {
+func defaultArgs(po *platformOpt, overrides map[string]string, target string) *llb.EnvList {
 	bp := po.buildPlatforms[0]
 	tp := po.targetPlatform
+	if target == "" {
+		target = "default"
+	}
 	s := [...][2]string{
 		{"BUILDPLATFORM", platforms.Format(bp)},
 		{"BUILDOS", bp.OS},
+		{"BUILDOSVERSION", bp.OSVersion},
 		{"BUILDARCH", bp.Architecture},
 		{"BUILDVARIANT", bp.Variant},
-		{"TARGETPLATFORM", platforms.Format(tp)},
+		{"TARGETPLATFORM", platforms.FormatAll(tp)},
 		{"TARGETOS", tp.OS},
+		{"TARGETOSVERSION", tp.OSVersion},
 		{"TARGETARCH", tp.Architecture},
 		{"TARGETVARIANT", tp.Variant},
+		{"TARGETSTAGE", target},
 	}
 	env := &llb.EnvList{}
 	for _, kv := range s {

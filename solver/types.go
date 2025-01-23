@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/compression"
@@ -267,4 +267,6 @@ type CacheManager interface {
 
 	// Save saves a result based on a cache key
 	Save(key *CacheKey, s Result, createdAt time.Time) (*ExportableCacheKey, error)
+
+	ReleaseUnreferenced(context.Context) error
 }

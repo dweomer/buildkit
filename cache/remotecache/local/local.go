@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/session"
 	sessioncontent "github.com/moby/buildkit/session/content"
@@ -107,7 +107,7 @@ func getContentStore(ctx context.Context, sm *session.Manager, g session.Group, 
 	}
 	timeoutCtx, cancel := context.WithCancelCause(ctx)
 	timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 5*time.Second, errors.WithStack(context.DeadlineExceeded))
-	defer cancel(errors.WithStack(context.Canceled))
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	caller, err := sm.Get(timeoutCtx, sessionID, false)
 	if err != nil {
