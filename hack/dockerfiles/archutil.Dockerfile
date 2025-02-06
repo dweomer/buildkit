@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile-upstream:master
 # check=error=true
 
-ARG GO_VERSION=1.22
-ARG ALPINE_VERSION=3.20
+ARG GO_VERSION=1.23
+ARG ALPINE_VERSION=3.21
 ARG DEBIAN_VERSION=trixie
 
 ARG BUILD_LOONG64=${TARGETPLATFORM#linux/amd64}
@@ -120,6 +120,8 @@ RUN --mount=type=bind,target=.,rw \
   if [ "$(ls -A /generated-files)" ]; then
     cp -rf /generated-files/* ./util/archutil
   fi
+  # loong64 is not stable atm
+  git checkout -- util/archutil/loong64_binary.go
   diff=$(git status --porcelain -- util/archutil)
   if [ -n "$diff" ]; then
     echo >&2 'ERROR: The result of archutil differs. Please update with "make archutil"'

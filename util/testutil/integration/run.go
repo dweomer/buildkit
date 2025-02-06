@@ -17,8 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/docker/cli/cli/config"
 	"github.com/gofrs/flock"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/contentutil"
@@ -39,6 +40,7 @@ type Backend interface {
 	Address() string
 	DockerAddress() string
 	ContainerdAddress() string
+	DebugAddress() string
 
 	Rootless() bool
 	NetNSDetached() bool
@@ -198,9 +200,9 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 						defer sandboxLimiter.Release(1)
 
 						ctx, cancel := context.WithCancelCause(ctx)
-						defer cancel(errors.WithStack(context.Canceled))
+						defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
-						sb, closer, err := newSandbox(ctx, br, getMirror(), mv)
+						sb, closer, err := newSandbox(ctx, t, br, getMirror(), mv)
 						require.NoError(t, err)
 						t.Cleanup(func() { _ = closer() })
 						defer func() {
@@ -256,7 +258,16 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 				defer closer()
 			}
 		} else {
-			desc, provider, err = contentutil.ProviderFromRef(from)
+			dockerConfig := config.LoadDefaultConfigFile(os.Stderr)
+
+			desc, provider, err = contentutil.ProviderFromRef(from, contentutil.WithCredentials(
+				func(host string) (string, string, error) {
+					ac, err := dockerConfig.GetAuthConfig(host)
+					if err != nil {
+						return "", "", err
+					}
+					return ac.Username, ac.Password, nil
+				}))
 			if err != nil {
 				return err
 			}
@@ -427,7 +438,16 @@ func prepareValueMatrix(tc testConf) []matrixValue {
 
 // Skips tests on platform
 func SkipOnPlatform(t *testing.T, goos string) {
-	if runtime.GOOS == goos {
+	skip := false
+	// support for negation
+	if strings.HasPrefix(goos, "!") {
+		goos = strings.TrimPrefix(goos, "!")
+		skip = runtime.GOOS != goos
+	} else {
+		skip = runtime.GOOS == goos
+	}
+
+	if skip {
 		t.Skipf("Skipped on %s", goos)
 	}
 }

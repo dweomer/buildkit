@@ -19,8 +19,8 @@ on:
       - 'frontend/dockerfile/docs/**'
 
 env:
-  GO_VERSION: "1.22"
-  SETUP_BUILDX_VERSION: "latest"
+  GO_VERSION: "1.23"
+  SETUP_BUILDX_VERSION: "edge"
   SETUP_BUILDKIT_TAG: "moby/buildkit:latest"
   SCOUT_VERSION: "1.13.0"
   IMAGE_NAME: "docker/dockerfile-upstream"
@@ -102,6 +102,8 @@ jobs:
       -
         name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:qemu-v9.2.0
       -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -178,7 +180,7 @@ jobs:
     steps:
       -
         name: GitHub Release
-        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191  # v2.0.8
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda  # v2.2.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

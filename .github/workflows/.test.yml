@@ -27,8 +27,8 @@ on:
         type: string
 
 env:
-  GO_VERSION: "1.22"
-  SETUP_BUILDX_VERSION: "latest"
+  GO_VERSION: "1.23"
+  SETUP_BUILDX_VERSION: "edge"
   SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
 
 jobs:
@@ -41,14 +41,10 @@ jobs:
       includes: ${{ steps.set.outputs.includes }}
     steps:
       -
-        name: Checkout
-        uses: actions/checkout@v4
-      -
-        name: Expose GitHub Runtime
-        uses: crazy-max/ghaction-github-runtime@v3
-      -
         name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:qemu-v9.2.0
       -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -89,7 +85,7 @@ jobs:
             });
       -
         name: Build
-        uses: docker/bake-action@v5
+        uses: docker/bake-action@v6
         with:
           targets: integration-tests-base
           set: |
@@ -104,7 +100,6 @@ jobs:
       TESTFLAGS: "-v --parallel=6 --timeout=30m"
       GOTESTSUM_FORMAT: "standard-verbose"
       TEST_IMAGE_BUILD: "0"
-      TEST_IMAGE_ID: "buildkit-tests"
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +107,7 @@ jobs:
           - containerd
           - containerd-rootless
           - containerd-1.6
+          - containerd-1.7
           - containerd-snapshotter-stargz
           - oci
           - oci-rootless
@@ -146,6 +142,8 @@ jobs:
       -
         name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:qemu-v9.2.0
       -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -155,12 +153,11 @@ jobs:
           buildkitd-flags: --debug
       -
         name: Build test image
-        uses: docker/bake-action@v5
+        uses: docker/bake-action@v6
         with:
           targets: integration-tests
           set: |
             *.cache-from=type=gha,scope=${{ inputs.cache_scope }}
-            *.output=type=docker,name=${{ env.TEST_IMAGE_ID }}
         env:
           BUILDKITD_TAGS: ${{ matrix.tags }}
           TEST_COVERAGE: 1
@@ -177,7 +174,7 @@ jobs:
       -
         name: Send to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           directory: ./bin/testreports
           flags: ${{ matrix.codecov_flags }}

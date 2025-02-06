@@ -354,9 +354,9 @@ func (b *llbBridge) ResolveSourceMetadata(ctx context.Context, op *pb.SourceOp, 
 	}
 	id := op.Identifier
 	if opt.Platform != nil {
-		id += platforms.Format(*opt.Platform)
+		id += platforms.FormatAll(*opt.Platform)
 	} else {
-		id += platforms.Format(platforms.DefaultSpec())
+		id += platforms.FormatAll(platforms.DefaultSpec())
 	}
 	pol, err := loadSourcePolicy(b.builder)
 	if err != nil {
@@ -423,6 +423,13 @@ func (lcm *lazyCacheManager) Save(key *solver.CacheKey, s solver.Result, created
 		return nil, err
 	}
 	return lcm.main.Save(key, s, createdAt)
+}
+
+func (lcm *lazyCacheManager) ReleaseUnreferenced(ctx context.Context) error {
+	if err := lcm.wait(); err != nil {
+		return err
+	}
+	return lcm.main.ReleaseUnreferenced(ctx)
 }
 
 func (lcm *lazyCacheManager) wait() error {
