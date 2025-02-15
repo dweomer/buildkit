@@ -13,14 +13,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
-	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/platforms"
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
-	"github.com/docker/docker/pkg/reexec"
 	"github.com/gofrs/flock"
 	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/cache/remotecache"
@@ -76,15 +74,12 @@ import (
 	"google.golang.org/grpc/health"
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 func init() {
 	apicaps.ExportedProduct = "buildkit"
 	stack.SetVersionInfo(version.Version, version.Revision)
-
-	if reexec.Init() {
-		os.Exit(0)
-	}
 
 	// enable in memory recording for buildkitd traces
 	detect.Recorder = detect.NewTraceRecorder()
@@ -194,9 +189,10 @@ func main() {
 			Value: groupValue(defaultConf.GRPC.GID),
 		},
 		cli.StringFlag{
-			Name:  "debugaddr",
-			Usage: "debugging address (eg. 0.0.0.0:6060)",
-			Value: defaultConf.GRPC.DebugAddress,
+			Name:   "debugaddr",
+			Usage:  "debugging address (eg. 0.0.0.0:6060)",
+			Value:  defaultConf.GRPC.DebugAddress,
+			EnvVar: "BUILDKITD_DEBUGADDR",
 		},
 		cli.StringFlag{
 			Name:  "tlscert",
@@ -221,6 +217,14 @@ func main() {
 			Name:  "otel-socket-path",
 			Usage: "OTEL collector trace socket path",
 		},
+		cli.BoolFlag{
+			Name:  "cdi-disabled",
+			Usage: "disables support of the Container Device Interface (CDI)",
+		},
+		cli.StringSliceFlag{
+			Name:  "cdi-spec-dir",
+			Usage: "list of directories to scan for CDI spec files",
+		},
 	)
 	app.Flags = append(app.Flags, appFlags...)
 	app.Flags = append(app.Flags, serviceFlags()...)
@@ -233,7 +237,7 @@ func main() {
 			return errors.New("rootless mode requires to be executed as the mapped root in a user namespace; you may use RootlessKit for setting up the namespace")
 		}
 		ctx, cancel := context.WithCancelCause(appcontext.Context())
-		defer cancel(errors.WithStack(context.Canceled))
+		defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 		cfg, err := config.LoadFile(c.GlobalString("config"))
 		if err != nil {
@@ -341,7 +345,7 @@ func main() {
 			return err
 		}
 
-		controller, err := newController(c, &cfg)
+		controller, err := newController(ctx, c, &cfg)
 		if err != nil {
 			return err
 		}
@@ -431,7 +435,7 @@ func newGRPCListeners(cfg config.GRPCConfig) ([]net.Listener, error) {
 
 	listeners := make([]net.Listener, 0, len(addrs))
 	for _, addr := range addrs {
-		l, err := getListener(addr, *cfg.UID, *cfg.GID, sd, tlsConfig)
+		l, err := getListener(addr, *cfg.UID, *cfg.GID, sd, tlsConfig, true)
 		if err != nil {
 			for _, l := range listeners {
 				l.Close()
@@ -542,28 +546,24 @@ func setDefaultConfig(cfg *config.Config) {
 	if cfg.OTEL.SocketPath == "" {
 		cfg.OTEL.SocketPath = appdefaults.TraceSocketPath(isRootlessConfig())
 	}
-}
 
-var (
-	isRootlessConfigOnce  sync.Once
-	isRootlessConfigValue bool
-)
+	if len(cfg.CDI.SpecDirs) == 0 {
+		cfg.CDI.SpecDirs = appdefaults.CDISpecDirs
+	}
+}
 
 // isRootlessConfig is true if we should be using the rootless config
 // defaults instead of the normal defaults.
 func isRootlessConfig() bool {
-	isRootlessConfigOnce.Do(func() {
-		if !userns.RunningInUserNS() {
-			// Default value is false so keep it that way.
-			return
-		}
-		// if buildkitd is being executed as the mapped-root (not only EUID==0 but also $USER==root)
-		// in a user namespace, we don't want to load the rootless changes in the
-		// configuration.
-		u := os.Getenv("USER")
-		isRootlessConfigValue = u != "" && u != "root"
-	})
-	return isRootlessConfigValue
+	if !userns.RunningInUserNS() {
+		// Default value is false so keep it that way.
+		return false
+	}
+	// if buildkitd is being executed as the mapped-root (not only EUID==0 but also $USER==root)
+	// in a user namespace, we don't want to load the rootless changes in the
+	// configuration.
+	u := os.Getenv("USER")
+	return u != "" && u != "root"
 }
 
 func applyMainFlags(c *cli.Context, cfg *config.Config) error {
@@ -632,6 +632,14 @@ func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 		cfg.OTEL.SocketPath = c.String("otel-socket-path")
 	}
 
+	if c.IsSet("cdi-disabled") {
+		cdiDisabled := c.Bool("cdi-disabled")
+		cfg.CDI.Disabled = &cdiDisabled
+	}
+	if c.IsSet("cdi-spec-dir") {
+		cfg.CDI.SpecDirs = c.StringSlice("cdi-spec-dir")
+	}
+
 	applyPlatformFlags(c)
 
 	return nil
@@ -670,7 +678,7 @@ func groupToGid(group string) (int, error) {
 	return id, nil
 }
 
-func getListener(addr string, uid, gid int, secDescriptor string, tlsConfig *tls.Config) (net.Listener, error) {
+func getListener(addr string, uid, gid int, secDescriptor string, tlsConfig *tls.Config, warnTLS bool) (net.Listener, error) {
 	addrSlice := strings.SplitN(addr, "://", 2)
 	if len(addrSlice) < 2 {
 		return nil, errors.Errorf("address %s does not contain proto, you meant unix://%s ?",
@@ -696,7 +704,9 @@ func getListener(addr string, uid, gid int, secDescriptor string, tlsConfig *tls
 		}
 
 		if tlsConfig == nil {
-			bklog.L.Warnf("TLS is not enabled for %s. enabling mutual TLS authentication is highly recommended", addr)
+			if warnTLS {
+				bklog.L.Warnf("TLS is not enabled for %s. enabling mutual TLS authentication is highly recommended", addr)
+			}
 			return l, nil
 		}
 		return tls.NewListener(l, tlsConfig), nil
@@ -758,7 +768,7 @@ func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
 	return tlsConf, nil
 }
 
-func newController(c *cli.Context, cfg *config.Config) (*control.Controller, error) {
+func newController(ctx context.Context, c *cli.Context, cfg *config.Config) (*control.Controller, error) {
 	sessionManager, err := session.NewManager()
 	if err != nil {
 		return nil, err
@@ -850,6 +860,8 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		LeaseManager:              w.LeaseManager(),
 		ContentStore:              w.ContentStore(),
 		HistoryConfig:             cfg.History,
+		GarbageCollect:            w.GarbageCollect,
+		GracefulStop:              ctx.Done(),
 	})
 }
 
@@ -1032,4 +1044,31 @@ func newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
 		opts = append(opts, sdkmetric.WithReader(r))
 	}
 	return sdkmetric.NewMeterProvider(opts...), nil
+}
+
+// getCDIManager returns a new CDI registry with disabled auto-refresh.
+func getCDIManager(disabled *bool, specDirs []string) (*cdi.Cache, error) {
+	if disabled != nil && *disabled {
+		return nil, nil
+	}
+	if len(specDirs) == 0 {
+		return nil, errors.New("No CDI specification directories specified")
+	}
+	cdiCache, err := func() (*cdi.Cache, error) {
+		cdiCache, err := cdi.NewCache(
+			cdi.WithSpecDirs(specDirs...),
+			cdi.WithAutoRefresh(false),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := cdiCache.Refresh(); err != nil {
+			return nil, err
+		}
+		return cdiCache, nil
+	}()
+	if err != nil {
+		return nil, errors.Wrapf(err, "CDI registry initialization failure")
+	}
+	return cdiCache, nil
 }

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	archiveexporter "github.com/containerd/containerd/images/archive"
-	"github.com/containerd/containerd/leases"
+	archiveexporter "github.com/containerd/containerd/v2/core/images/archive"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/distribution/reference"
 	"github.com/moby/buildkit/cache"
 	cacheconfig "github.com/moby/buildkit/cache/config"
@@ -218,7 +218,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 
 	timeoutCtx, cancel := context.WithCancelCause(ctx)
 	timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 5*time.Second, errors.WithStack(context.DeadlineExceeded))
-	defer cancel(errors.WithStack(context.Canceled))
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	caller, err := e.opt.SessionManager.Get(timeoutCtx, sessionID, false)
 	if err != nil {

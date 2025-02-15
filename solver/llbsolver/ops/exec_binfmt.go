@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/platforms"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/snapshot"
@@ -27,7 +27,6 @@ var qemuArchMap = map[string]string{
 	"riscv64": "riscv64",
 	"arm":     "arm",
 	"s390x":   "s390x",
-	"ppc64":   "ppc64",
 	"ppc64le": "ppc64le",
 	"386":     "i386",
 }

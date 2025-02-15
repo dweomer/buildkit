@@ -41,6 +41,7 @@ func InitDockerdWorker() {
 			FeatureSBOM,
 			FeatureSecurityMode,
 			FeatureCNINetwork,
+			FeatureCDI,
 		},
 	})
 	integration.Register(&Moby{
@@ -50,6 +51,8 @@ func InitDockerdWorker() {
 		Unsupported: []string{
 			FeatureSecurityMode,
 			FeatureCNINetwork,
+			FeatureContentCheck,
+			FeatureCDI,
 		},
 	})
 }

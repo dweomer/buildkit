@@ -7,11 +7,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/diff"
-	"github.com/containerd/containerd/gc"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/gc"
 	"github.com/containerd/platforms"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/hashicorp/go-multierror"
@@ -33,6 +33,7 @@ import (
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/snapshot/imagerefchecker"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/llbsolver/mounts"
 	"github.com/moby/buildkit/solver/llbsolver/ops"
 	"github.com/moby/buildkit/solver/pb"
@@ -82,6 +83,7 @@ type WorkerOpt struct {
 	MetadataStore    *metadata.Store
 	MountPoolRoot    string
 	ResourceMonitor  *resources.Monitor
+	CDIManager       *cdidevices.Manager
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
@@ -211,6 +213,14 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 	}, nil
 }
 
+func (w *Worker) GarbageCollect(ctx context.Context) error {
+	if w.WorkerOpt.GarbageCollect == nil {
+		return nil
+	}
+	_, err := w.WorkerOpt.GarbageCollect(ctx)
+	return err
+}
+
 func (w *Worker) Close() error {
 	var rerr error
 	if err := w.MetadataStore.Close(); err != nil {
@@ -235,6 +245,10 @@ func (w *Worker) ContentStore() *containerdsnapshot.Store {
 
 func (w *Worker) LeaseManager() *leaseutil.Manager {
 	return w.WorkerOpt.LeaseManager
+}
+
+func (w *Worker) CDIManager() *cdidevices.Manager {
+	return w.WorkerOpt.CDIManager
 }
 
 func (w *Worker) ID() string {

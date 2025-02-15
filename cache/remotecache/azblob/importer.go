@@ -7,9 +7,10 @@ import (
 	"io"
 	"sync"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/labels"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/moby/buildkit/cache/remotecache"
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/session"
@@ -29,12 +30,12 @@ func ResolveCacheImporterFunc() remotecache.ResolveCacheImporterFunc {
 	return func(ctx context.Context, g session.Group, attrs map[string]string) (remotecache.Importer, ocispecs.Descriptor, error) {
 		config, err := getConfig(attrs)
 		if err != nil {
-			return nil, ocispecs.Descriptor{}, errors.WithMessage(err, "failed to create azblob config")
+			return nil, ocispecs.Descriptor{}, errors.Wrap(err, "failed to create azblob config")
 		}
 
 		containerClient, err := createContainerClient(ctx, config)
 		if err != nil {
-			return nil, ocispecs.Descriptor{}, errors.WithMessage(err, "failed to create container client")
+			return nil, ocispecs.Descriptor{}, errors.Wrap(err, "failed to create container client")
 		}
 
 		importer := &importer{
@@ -50,7 +51,7 @@ var _ remotecache.Importer = &importer{}
 
 type importer struct {
 	config          *Config
-	containerClient *azblob.ContainerClient
+	containerClient *container.Client
 }
 
 func (ci *importer) Resolve(ctx context.Context, _ ocispecs.Descriptor, id string, w worker.Worker) (solver.CacheManager, error) {
@@ -100,17 +101,16 @@ func (ci *importer) loadManifest(ctx context.Context, name string) (*v1.CacheCha
 		return v1.NewCacheChains(), nil
 	}
 
-	blobClient, err := ci.containerClient.NewBlockBlobClient(key)
-	if err != nil {
-		return nil, errors.Wrap(err, "error creating container client")
-	}
+	blobClient := ci.containerClient.NewBlockBlobClient(key)
 
-	res, err := blobClient.Download(ctx, &azblob.BlobDownloadOptions{})
+	res, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	bytes, err := io.ReadAll(res.RawResponse.Body)
+	reader := res.Body
+	defer reader.Close()
+	bytes, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -177,12 +177,12 @@ func (ci *importer) makeDescriptorProviderPair(l v1.CacheLayer) (*v1.DescriptorP
 }
 
 type fetcher struct {
-	containerClient *azblob.ContainerClient
+	containerClient *container.Client
 	config          *Config
 }
 
 func (f *fetcher) Fetch(ctx context.Context, desc ocispecs.Descriptor) (io.ReadCloser, error) {
-	key := blobKey(f.config, desc.Digest.String())
+	key := blobKey(f.config, desc.Digest)
 	exists, err := blobExists(ctx, f.containerClient, key)
 	if err != nil {
 		return nil, err
@@ -194,23 +194,19 @@ func (f *fetcher) Fetch(ctx context.Context, desc ocispecs.Descriptor) (io.ReadC
 
 	bklog.G(ctx).Debugf("reading layer from cache: %s", key)
 
-	blobClient, err := f.containerClient.NewBlockBlobClient(key)
-	if err != nil {
-		return nil, errors.Wrap(err, "error creating block blob client")
-	}
-
-	res, err := blobClient.Download(ctx, &azblob.BlobDownloadOptions{})
+	blobClient := f.containerClient.NewBlockBlobClient(key)
+	res, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	return res.RawResponse.Body, nil
+	return res.Body, nil
 }
 
 type ciProvider struct {
 	content.Provider
 	desc            ocispecs.Descriptor
-	containerClient *azblob.ContainerClient
+	containerClient *container.Client
 	config          *Config
 	checkMutex      sync.Mutex
 	checked         bool
@@ -231,7 +227,7 @@ func (p *ciProvider) Info(ctx context.Context, dgst digest.Digest) (content.Info
 	p.checkMutex.Lock()
 	defer p.checkMutex.Unlock()
 
-	key := blobKey(p.config, dgst.String())
+	key := blobKey(p.config, dgst)
 	exists, err := blobExists(ctx, p.containerClient, key)
 	if err != nil {
 		return content.Info{}, err

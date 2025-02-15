@@ -10,8 +10,8 @@ import (
 	"time"
 
 	contentapi "github.com/containerd/containerd/api/services/content/v1"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/services/content/contentserver"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/plugins/services/content/contentserver"
 	"github.com/distribution/reference"
 	"github.com/hashicorp/go-multierror"
 	"github.com/mitchellh/hashstructure/v2"
@@ -33,6 +33,7 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/bboltcachestorage"
 	"github.com/moby/buildkit/solver/llbsolver"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/llbsolver/proc"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/bklog"
@@ -70,18 +71,21 @@ type Opt struct {
 	LeaseManager              *leaseutil.Manager
 	ContentStore              *containerdsnapshot.Store
 	HistoryConfig             *config.HistoryConfig
+	GarbageCollect            func(context.Context) error
+	GracefulStop              <-chan struct{}
 }
 
 type Controller struct { // TODO: ControlService
 	// buildCount needs to be 64bit aligned
-	buildCount       int64
-	opt              Opt
-	solver           *llbsolver.Solver
-	history          *llbsolver.HistoryQueue
-	cache            solver.CacheManager
-	gatewayForwarder *controlgateway.GatewayForwarder
-	throttledGC      func()
-	gcmu             sync.Mutex
+	buildCount                   int64
+	opt                          Opt
+	solver                       *llbsolver.Solver
+	history                      *llbsolver.HistoryQueue
+	cache                        solver.CacheManager
+	gatewayForwarder             *controlgateway.GatewayForwarder
+	throttledGC                  func()
+	throttledReleaseUnreferenced func()
+	gcmu                         sync.Mutex
 	tracev1.UnimplementedTraceServiceServer
 }
 
@@ -89,10 +93,12 @@ func NewController(opt Opt) (*Controller, error) {
 	gatewayForwarder := controlgateway.NewGatewayForwarder()
 
 	hq, err := llbsolver.NewHistoryQueue(llbsolver.HistoryQueueOpt{
-		DB:           opt.HistoryDB,
-		LeaseManager: opt.LeaseManager,
-		ContentStore: opt.ContentStore,
-		CleanConfig:  opt.HistoryConfig,
+		DB:             opt.HistoryDB,
+		LeaseManager:   opt.LeaseManager,
+		ContentStore:   opt.ContentStore,
+		CleanConfig:    opt.HistoryConfig,
+		GarbageCollect: opt.GarbageCollect,
+		GracefulStop:   opt.GracefulStop,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create history queue")
@@ -120,6 +126,8 @@ func NewController(opt Opt) (*Controller, error) {
 		gatewayForwarder: gatewayForwarder,
 	}
 	c.throttledGC = throttle.After(time.Minute, c.gc)
+	// use longer interval for releaseUnreferencedCache deleting links quickly is less important
+	c.throttledReleaseUnreferenced = throttle.After(5*time.Minute, func() { c.releaseUnreferencedCache(context.TODO()) })
 
 	defer func() {
 		time.AfterFunc(time.Second, c.throttledGC)
@@ -188,6 +196,10 @@ func (c *Controller) DiskUsage(ctx context.Context, r *controlapi.DiskUsageReque
 		}
 	}
 	return resp, nil
+}
+
+func (c *Controller) releaseUnreferencedCache(ctx context.Context) error {
+	return c.cache.ReleaseUnreferenced(ctx)
 }
 
 func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Control_PruneServer) error {
@@ -575,6 +587,7 @@ func (c *Controller) ListWorkers(ctx context.Context, r *controlapi.ListWorkersR
 			Platforms:       pb.PlatformsFromSpec(w.Platforms(true)),
 			GCPolicy:        toPBGCPolicy(w.GCPolicy()),
 			BuildkitVersion: toPBBuildkitVersion(w.BuildkitVersion()),
+			CDIDevices:      toPBCDIDevices(w.CDIManager()),
 		})
 	}
 	return resp, nil
@@ -612,14 +625,12 @@ func (c *Controller) gc() {
 	}()
 
 	for _, w := range workers {
-		func(w worker.Worker) {
-			eg.Go(func() error {
-				if policy := w.GCPolicy(); len(policy) > 0 {
-					return w.Prune(ctx, ch, policy...)
-				}
-				return nil
-			})
-		}(w)
+		eg.Go(func() error {
+			if policy := w.GCPolicy(); len(policy) > 0 {
+				return w.Prune(ctx, ch, policy...)
+			}
+			return nil
+		})
 	}
 
 	err = eg.Wait()
@@ -630,6 +641,7 @@ func (c *Controller) gc() {
 	<-done
 	if size > 0 {
 		bklog.G(ctx).Debugf("gc cleaned up %d bytes", size)
+		go c.throttledReleaseUnreferenced()
 	}
 }
 
@@ -672,6 +684,23 @@ func toPBBuildkitVersion(in client.BuildkitVersion) *apitypes.BuildkitVersion {
 		Version:  in.Version,
 		Revision: in.Revision,
 	}
+}
+
+func toPBCDIDevices(manager *cdidevices.Manager) []*apitypes.CDIDevice {
+	if manager == nil {
+		return nil
+	}
+	devs := manager.ListDevices()
+	out := make([]*apitypes.CDIDevice, 0, len(devs))
+	for _, dev := range devs {
+		out = append(out, &apitypes.CDIDevice{
+			Name:        dev.Name,
+			AutoAllow:   true, // TODO
+			Annotations: dev.Annotations,
+			OnDemand:    dev.OnDemand,
+		})
+	}
+	return out
 }
 
 func findDuplicateCacheOptions(cacheOpts []*controlapi.CacheOptionsEntry) ([]*controlapi.CacheOptionsEntry, error) {

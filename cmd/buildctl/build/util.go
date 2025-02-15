@@ -2,6 +2,7 @@ package build
 
 import (
 	"os"
+	"strconv"
 
 	"github.com/pkg/errors"
 
@@ -15,6 +16,22 @@ import (
 // environments variables and add it to cache Options
 // Since it works for both import and export
 func loadGithubEnv(cache client.CacheOptionsEntry) (client.CacheOptionsEntry, error) {
+	version, ok := cache.Attrs["version"]
+	if !ok {
+		if v, ok := os.LookupEnv("ACTIONS_CACHE_SERVICE_V2"); ok {
+			if b, err := strconv.ParseBool(v); err == nil && b {
+				version = "2"
+			}
+		}
+	}
+
+	if _, ok := cache.Attrs["url_v2"]; !ok && version == "2" {
+		url, ok := os.LookupEnv("ACTIONS_RESULTS_URL")
+		if !ok {
+			return cache, errors.New("cache with type gha requires url parameter or $ACTIONS_RESULTS_URL")
+		}
+		cache.Attrs["url_v2"] = url
+	}
 	if _, ok := cache.Attrs["url"]; !ok {
 		url, ok := os.LookupEnv("ACTIONS_CACHE_URL")
 		if !ok {

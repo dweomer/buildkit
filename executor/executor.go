@@ -6,7 +6,7 @@ import (
 	"net"
 	"syscall"
 
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/docker/docker/pkg/idtools"
 	resourcestypes "github.com/moby/buildkit/executor/resources/types"
 	"github.com/moby/buildkit/solver/pb"
@@ -22,6 +22,7 @@ type Meta struct {
 	ReadonlyRootFS bool
 	ExtraHosts     []HostIP
 	Ulimit         []*pb.Ulimit
+	CDIDevices     []*pb.CDIDevice
 	CgroupParent   string
 	NetMode        pb.NetMode
 	SecurityMode   pb.SecurityMode

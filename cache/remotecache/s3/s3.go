@@ -18,8 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/labels"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/moby/buildkit/cache/remotecache"
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/session"
@@ -454,10 +454,13 @@ func (s3Client *s3Client) getManifest(ctx context.Context, key string, config *v
 	return true, nil
 }
 
-func (s3Client *s3Client) getReader(ctx context.Context, key string) (io.ReadCloser, error) {
+func (s3Client *s3Client) getReader(ctx context.Context, key string, offset int64) (io.ReadCloser, error) {
 	input := &s3.GetObjectInput{
 		Bucket: &s3Client.bucket,
 		Key:    &key,
+	}
+	if offset > 0 {
+		input.Range = aws.String(fmt.Sprintf("bytes=%d-", offset))
 	}
 
 	output, err := s3Client.GetObject(ctx, input)
@@ -588,7 +591,7 @@ func (s3Client *s3Client) touch(ctx context.Context, key string, size *int64) (e
 
 func (s3Client *s3Client) ReaderAt(ctx context.Context, desc ocispecs.Descriptor) (content.ReaderAt, error) {
 	readerAtCloser := toReaderAtCloser(func(offset int64) (io.ReadCloser, error) {
-		return s3Client.getReader(ctx, s3Client.blobKey(desc.Digest))
+		return s3Client.getReader(ctx, s3Client.blobKey(desc.Digest), offset)
 	})
 	return &readerAt{ReaderAtCloser: readerAtCloser, size: desc.Size}, nil
 }

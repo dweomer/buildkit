@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/distribution/reference"
 	"github.com/docker/docker/pkg/idtools"
 	apitypes "github.com/moby/buildkit/api/types"
@@ -191,14 +191,22 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 		if err != nil {
 			return nil, err
 		}
-		st, dockerImage, err := dc.NamedContext(ctx, source, dockerui.ContextOpt{
+		nc, err := dc.NamedContext(source, dockerui.ContextOpt{
 			CaptureDigest: &mfstDigest,
 		})
 		if err != nil {
 			return nil, err
 		}
-		if dockerImage != nil {
-			img = *dockerImage
+		var st *llb.State
+		if nc != nil {
+			var dockerImage *dockerspec.DockerOCIImage
+			st, dockerImage, err = nc.Load(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if dockerImage != nil {
+				img = *dockerImage
+			}
 		}
 		if st == nil {
 			sourceRef, err := reference.ParseNormalizedNamed(source)

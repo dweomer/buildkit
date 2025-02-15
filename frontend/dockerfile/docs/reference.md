@@ -47,8 +47,8 @@ be UPPERCASE to distinguish them from arguments more easily.
 Docker runs instructions in a Dockerfile in order. A Dockerfile **must
 begin with a `FROM` instruction**. This may be after [parser
 directives](#parser-directives), [comments](#format), and globally scoped
-[ARGs](#arg). The `FROM` instruction specifies the [parent
-image](https://docs.docker.com/glossary/#parent-image) from which you are
+[ARGs](#arg). The `FROM` instruction specifies the [base
+image](https://docs.docker.com/glossary/#base-image) from which you are
 building. `FROM` may only be preceded by one or more `ARG` instructions, which
 declare arguments that are used in `FROM` lines in the Dockerfile.
 
@@ -191,11 +191,6 @@ following lines are all treated identically:
 # directive = value
 #	  dIrEcTiVe=value
 ```
-
-The following parser directives are supported:
-
-- `syntax`
-- `escape`
 
 ### syntax
 
@@ -347,7 +342,7 @@ despite warnings. To make the build fail on warnings, set `#check=error=true`.
 
 > [!NOTE]
 > When using the `check` directive, with `error=true` option, it is recommended
-> to pin the [Dockerfile syntax]((#syntax)) to a specific version. Otherwise, your build may
+> to pin the [Dockerfile syntax](#syntax) to a specific version. Otherwise, your build may
 > start to fail when new checks are added in the future versions.
 
 To combine both the `skip` and `error` options, use a semi-colon to separate
@@ -943,7 +938,6 @@ The command is run in the host's network environment (similar to
 > which needs to be enabled when starting the buildkitd daemon with
 > `--allow-insecure-entitlement network.host` flag or in [buildkitd config](https://github.com/moby/buildkit/blob/master/docs/buildkitd.toml.md),
 > and for a build request with [`--allow network.host` flag](https://docs.docker.com/engine/reference/commandline/buildx_build/#allow).
-{ .warning }
 
 ### RUN --security
 
@@ -964,7 +958,6 @@ This is equivalent to running `docker run --privileged`.
 > enabled when starting the buildkitd daemon with
 > `--allow-insecure-entitlement security.insecure` flag or in [buildkitd config](https://github.com/moby/buildkit/blob/master/docs/buildkitd.toml.md),
 > and for a build request with [`--allow security.insecure` flag](https://docs.docker.com/engine/reference/commandline/buildx_build/#allow).
-{ .warning }
 
 Default sandbox mode can be activated via `--security=sandbox`, but that is no-op.
 
@@ -1052,9 +1045,9 @@ LABEL multi.label1="value1" \
 > using string interpolation (e.g. `LABEL example="foo-$ENV_VAR"`), single
 > quotes will take the string as is without unpacking the variable's value.
 
-Labels included in base or parent images (images in the `FROM` line) are
-inherited by your image. If a label already exists but with a different value,
-the most-recently-applied value overrides any previously-set value.
+Labels included in base images (images in the `FROM` line) are inherited by
+your image. If a label already exists but with a different value, the
+most-recently-applied value overrides any previously-set value.
 
 To view an image's labels, use the `docker image inspect` command. You can use
 the `--format` option to show just the labels;
@@ -1237,7 +1230,7 @@ The available `[OPTIONS]` are:
 | [`--chown`](#add---chown---chmod)       |                            |
 | [`--chmod`](#add---chown---chmod)       | 1.2                        |
 | [`--link`](#add---link)                 | 1.4                        |
-| [`--exclude`](#add---exclude)           | 1.7                        |
+| [`--exclude`](#add---exclude)           | 1.7-labs                   |
 
 The `ADD` instruction copies new files or directories from `<src>` and adds
 them to the filesystem of the image at the path `<dest>`. Files and directories
@@ -1287,11 +1280,11 @@ relative to the build context. For example, if the build context is the current
 directory, `ADD file.txt /` adds the file at `./file.txt` to the root of the
 filesystem in the build container.
 
-When adding source files from the build context, their paths are interpreted as
-relative to the root of the context. If you specify a relative path leading
-outside of the build context, such as `ADD ../something /something`, parent
-directory paths are stripped out automatically. The effective source path in
-this example becomes `ADD something /something`.
+Specifying a source path with a leading slash or one that navigates outside the
+build context, such as `ADD ../something /something`, automatically removes any
+parent directory navigation (`../`). Trailing slashes in the source path are
+also disregarded, making `ADD something/ /something` equivalent to `ADD
+something /something`.
 
 If the source is a directory, the contents of the directory are copied,
 including filesystem metadata. The directory itself isn't copied, only its
@@ -1483,8 +1476,8 @@ ADD [--checksum=<hash>] <src> ... <dir>
 ```
 
 The `--checksum` flag lets you verify the checksum of a remote resource. The
-checksum is formatted as `<algorithm>:<hash>`. The supported algorithms are
-`sha256`, `sha384`, and `sha512`.
+checksum is formatted as `sha256:<hash>`. SHA-256 is the only supported hash
+algorithm.
 
 ```dockerfile
 ADD --checksum=sha256:24454f830cdb571e2c4ad15481119c43b3cafd48dd869a9b2945d1036d1dc68d https://mirrors.edge.kernel.org/pub/linux/kernel/Historic/linux-0.01.tar.gz /
@@ -1522,8 +1515,8 @@ The available `[OPTIONS]` are:
 | [`--chown`](#copy---chown---chmod) |                            |
 | [`--chmod`](#copy---chown---chmod) | 1.2                        |
 | [`--link`](#copy---link)           | 1.4                        |
-| [`--parents`](#copy---parents)     | 1.7                        |
-| [`--exclude`](#copy---exclude)     | 1.7                        |
+| [`--parents`](#copy---parents)     | 1.7-labs                   |
+| [`--exclude`](#copy---exclude)     | 1.7-labs                   |
 
 The `COPY` instruction copies new files or directories from `<src>` and adds
 them to the filesystem of the image at the path `<dest>`. Files and directories
@@ -1563,11 +1556,14 @@ For more information about copying from named sources, see the
 
 #### Copying from the build context
 
-When copying source files from the build context, their paths are interpreted as
-relative to the root of the context. If you specify a relative path leading
-outside of the build context, such as `COPY ../something /something`, parent
-directory paths are stripped out automatically. The effective source path in
-this example becomes `COPY something /something`.
+When copying source files from the build context, paths are interpreted as
+relative to the root of the context.
+
+Specifying a source path with a leading slash or one that navigates outside the
+build context, such as `COPY ../something /something`, automatically removes
+any parent directory navigation (`../`). Trailing slashes in the source path
+are also disregarded, making `COPY something/ /something` equivalent to `COPY
+something /something`.
 
 If the source is a directory, the contents of the directory are copied,
 including filesystem metadata. The directory itself isn't copied, only its
@@ -1820,7 +1816,7 @@ COPY [--parents[=<boolean>]] <src> ... <dest>
 The `--parents` flag preserves parent directories for `src` entries. This flag defaults to `false`.
 
 ```dockerfile
-# syntax=docker/dockerfile:1.7-labs
+# syntax=docker/dockerfile:1-labs
 FROM scratch
 
 COPY ./x/a.txt ./y/a.txt /no_parents/
@@ -1840,7 +1836,7 @@ directories after it will be preserved. This may be especially useful copies bet
 with `--from` where the source paths need to be absolute.
 
 ```dockerfile
-# syntax=docker/dockerfile:1.7-labs
+# syntax=docker/dockerfile:1-labs
 FROM scratch
 
 COPY --parents ./x/./y/*.txt /parents/
@@ -1882,6 +1878,9 @@ supporting wildcards and matching using Go's
 For example, to add all files starting with "hom", excluding files with a `.txt` extension:
 
 ```dockerfile
+# syntax=docker/dockerfile:1-labs
+FROM scratch
+
 COPY --exclude=*.txt hom* /mydir/
 ```
 
@@ -1891,6 +1890,9 @@ even if the files paths match the pattern specified in `<src>`.
 To add all files starting with "hom", excluding files with either `.txt` or `.md` extensions:
 
 ```dockerfile
+# syntax=docker/dockerfile:1-labs
+FROM scratch
+
 COPY --exclude=*.txt --exclude=*.md hom* /mydir/
 ```
 
@@ -2217,7 +2219,8 @@ Keep the following things in mind about volumes in the Dockerfile.
   - a drive other than `C:`
 
 - **Changing the volume from within the Dockerfile**: If any build steps change the
-  data within the volume after it has been declared, those changes will be discarded.
+  data within the volume after it has been declared, those changes will be discarded
+  when using the legacy builder. When using Buildkit, the changes will instead be kept.
 
 - **JSON formatting**: The list is parsed as a JSON array.
   You must enclose words with double quotes (`"`) rather than single quotes (`'`).
@@ -2255,7 +2258,6 @@ runtime, runs the relevant `ENTRYPOINT` and `CMD` commands.
 >
 > On Windows, the user must be created first if it's not a built-in account.
 > This can be done with the `net user` command called as part of a Dockerfile.
-{ .warning }
 
 ```dockerfile
 FROM microsoft/windowsservercore
@@ -2326,7 +2328,6 @@ flag.
 >
 > Refer to the [`RUN --mount=type=secret`](#run---mounttypesecret) section to
 > learn about secure ways to use secrets when building images.
-{ .warning }
 
 A Dockerfile may include one or more `ARG` instructions. For example,
 the following is a valid Dockerfile:

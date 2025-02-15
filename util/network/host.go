@@ -1,12 +1,11 @@
 //go:build !windows
-// +build !windows
 
 package network
 
 import (
 	"context"
 
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	resourcestypes "github.com/moby/buildkit/executor/resources/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )

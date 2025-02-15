@@ -9,9 +9,10 @@ import (
 	"strings"
 	"time"
 
-	ctd "github.com/containerd/containerd"
-	"github.com/containerd/containerd/defaults"
+	ctd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/disk"
 	"github.com/moby/buildkit/util/network/cniprovider"
@@ -114,7 +115,7 @@ func init() {
 		cli.StringFlag{
 			Name:  "containerd-worker-snapshotter",
 			Usage: "snapshotter name to use",
-			Value: ctd.DefaultSnapshotter,
+			Value: defaults.DefaultSnapshotter,
 		},
 		cli.StringFlag{
 			Name:  "containerd-worker-apparmor-profile",
@@ -282,6 +283,11 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 
 	dns := getDNSConfig(common.config.DNS)
 
+	cdiManager, err := getCDIManager(common.config.CDI.Disabled, common.config.CDI.SpecDirs)
+	if err != nil {
+		return nil, err
+	}
+
 	nc := netproviders.Opt{
 		Mode: common.config.Workers.Containerd.NetworkConfig.Mode,
 		CNI: cniprovider.Opt{
@@ -299,7 +305,7 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 		parallelismSem = semaphore.NewWeighted(int64(cfg.MaxParallelism))
 	}
 
-	snapshotter := ctd.DefaultSnapshotter
+	snapshotter := defaults.DefaultSnapshotter
 	if cfg.Snapshotter != "" {
 		snapshotter = cfg.Snapshotter
 	}
@@ -339,6 +345,7 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 		ParallelismSem:  parallelismSem,
 		TraceSocket:     common.traceSocket,
 		Runtime:         runtime,
+		CDIManager:      cdidevices.NewManager(cdiManager),
 	}
 
 	opt, err := containerd.NewWorkerOpt(workerOpts, ctd.WithTimeout(60*time.Second))

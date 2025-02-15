@@ -19,8 +19,8 @@ on:
       - 'frontend/dockerfile/docs/**'
 
 env:
-  GO_VERSION: "1.22"
-  SETUP_BUILDX_VERSION: "latest"
+  GO_VERSION: "1.23"
+  SETUP_BUILDX_VERSION: "edge"
   SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
   DESTDIR: "./bin"
 
@@ -40,9 +40,6 @@ jobs:
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
       -
-        name: Checkout
-        uses: actions/checkout@v4
-      -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -51,7 +48,7 @@ jobs:
           buildkitd-flags: --debug
       -
         name: Build
-        uses: docker/bake-action@v5
+        uses: docker/bake-action@v6
         with:
           provenance: false
           targets: binaries-for-test
@@ -73,7 +70,8 @@ jobs:
           retention-days: 1
 
   test-windows-amd64:
-    runs-on: windows-2022
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-2025' }}
     needs:
       - build
     env:
@@ -82,6 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-2022, windows-2025]
         worker:
           - containerd
         pkg:
@@ -92,7 +91,12 @@ jobs:
           - ./frontend
           - ./frontend/dockerfile
         include:
-          -
+          - os: windows-2022
+            worker: containerd
+            pkg: ./...
+            skip-integration-tests: 1
+          - os: windows-2025
+            worker: containerd
             pkg: ./...
             skip-integration-tests: 1
     steps:
@@ -147,7 +151,7 @@ jobs:
       -
         name: Send to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           directory: ./bin/testreports
           env_vars: RUNNER_OS
@@ -165,7 +169,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports-${{ env.TEST_REPORT_NAME }}
+          name: test-reports-${{ matrix.os }}-${{ env.TEST_REPORT_NAME }}
           path: ./bin/testreports
           retention-days: 1
       -
@@ -201,8 +205,10 @@ jobs:
         name: Install vagrant
         run: |
           set -x
+          wget -O - https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
           sudo apt-get update
-          sudo apt-get install -y libvirt-daemon libvirt-daemon-system vagrant vagrant-libvirt ruby-libvirt
+          sudo apt-get install -y libvirt-dev libvirt-daemon libvirt-daemon-system vagrant vagrant-libvirt ruby-libvirt
           sudo systemctl enable --now libvirtd
           sudo chmod a+rw /var/run/libvirt/libvirt-sock
           vagrant plugin install vagrant-libvirt
@@ -230,3 +236,27 @@ jobs:
         if: always()
         run: |
           vagrant ssh -- "sudo cat /vagrant/.tmp/logs/containerd"
+
+  sandbox-build:
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+    steps:
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
+      -
+        name: Build
+        uses: docker/bake-action@v6
+        with:
+          targets: integration-tests-base
+          set: |
+            *.platform=${{ matrix.platform }}

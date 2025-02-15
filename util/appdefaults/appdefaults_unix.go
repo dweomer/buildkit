@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package appdefaults
 
@@ -18,6 +17,7 @@ const (
 
 var (
 	UserCNIConfigPath = filepath.Join(UserConfigDir(), "cni.json")
+	CDISpecDirs       = []string{"/etc/cdi", "/var/run/cdi", "/etc/buildkit/cdi"}
 )
 
 // UserAddress typically returns /run/user/$UID/buildkit/buildkitd.sock

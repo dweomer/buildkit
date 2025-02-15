@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,6 +46,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	mode "github.com/tonistiigi/dchapes-mode"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -204,17 +206,17 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 		return nil, errors.Errorf("Client and MainContext cannot both be provided")
 	}
 
-	namedContext := func(ctx context.Context, name string, copt dockerui.ContextOpt) (*llb.State, *dockerspec.DockerOCIImage, error) {
+	namedContext := func(name string, copt dockerui.ContextOpt) (*dockerui.NamedContext, error) {
 		if opt.Client == nil {
-			return nil, nil, nil
+			return nil, nil
 		}
 		if !strings.EqualFold(name, "scratch") && !strings.EqualFold(name, "context") {
 			if copt.Platform == nil {
 				copt.Platform = opt.TargetPlatform
 			}
-			return opt.Client.NamedContext(ctx, name, copt)
+			return opt.Client.NamedContext(name, copt)
 		}
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	lint, err := newRuleLinter(dt, &opt)
@@ -226,10 +228,6 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 		caps := opt.Client.BuildOpts().LLBCaps
 		opt.LLBCaps = &caps
 	}
-
-	platformOpt := buildPlatformOpt(&opt)
-
-	globalArgs := platformArgs(platformOpt, opt.BuildArgs)
 
 	dockerfile, err := parser.Parse(bytes.NewReader(dt))
 	if err != nil {
@@ -260,6 +258,13 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 	}
 	validateStageNames(stages, lint)
 	validateCommandCasing(stages, lint)
+
+	platformOpt := buildPlatformOpt(&opt)
+	targetName := opt.Target
+	if targetName == "" {
+		targetName = stages[len(stages)-1].Name
+	}
+	globalArgs := defaultArgs(platformOpt, opt.BuildArgs, targetName)
 
 	shlex := shell.NewLex(dockerfile.EscapeToken)
 	outline := newOutlineCapture()
@@ -344,7 +349,7 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 		}
 
 		if st.Name != "" {
-			s, img, err := namedContext(ctx, st.Name, dockerui.ContextOpt{
+			nc, err := namedContext(st.Name, dockerui.ContextOpt{
 				Platform:       ds.platform,
 				ResolveMode:    opt.ImageResolveMode.String(),
 				AsyncLocalOpts: ds.asyncLocalOpts,
@@ -352,26 +357,10 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 			if err != nil {
 				return nil, err
 			}
-			if s != nil {
-				ds.dispatched = true
-				ds.state = *s
-				if img != nil {
-					// timestamps are inherited as-is, regardless to SOURCE_DATE_EPOCH
-					// https://github.com/moby/buildkit/issues/4614
-					ds.image = *img
-					if img.Architecture != "" && img.OS != "" {
-						ds.platform = &ocispecs.Platform{
-							OS:           img.OS,
-							Architecture: img.Architecture,
-							Variant:      img.Variant,
-							OSVersion:    img.OSVersion,
-						}
-						if img.OSFeatures != nil {
-							ds.platform.OSFeatures = append([]string{}, img.OSFeatures...)
-						}
-					}
-				}
+			if nc != nil {
+				ds.namedContext = nc
 				allDispatchStates.addState(ds)
+				ds.base = nil // reset base set by addState
 				continue
 			}
 		}
@@ -461,7 +450,7 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 			// resolve image config for every stage
 			if d.base == nil && !d.dispatched && !d.resolved {
 				d.resolved = reachable // avoid re-resolving if called again after onbuild
-				if d.stage.BaseName == emptyImageName {
+				if d.stage.BaseName == emptyImageName && d.namedContext == nil {
 					d.state = llb.Scratch()
 					d.image = emptyImage(platformOpt.targetPlatform)
 					d.platform = &platformOpt.targetPlatform
@@ -493,28 +482,61 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 						d.stage.BaseName = reference.TagNameOnly(ref).String()
 
 						var isScratch bool
-						st, img, err := namedContext(ctx, d.stage.BaseName, dockerui.ContextOpt{
-							ResolveMode:    opt.ImageResolveMode.String(),
-							Platform:       platform,
-							AsyncLocalOpts: d.asyncLocalOpts,
-						})
-						if err != nil {
-							return err
-						}
-						if st != nil {
-							if img != nil {
-								d.image = *img
-							} else {
-								d.image = emptyImage(platformOpt.targetPlatform)
-							}
-							d.state = st.Platform(*platform)
-							d.platform = platform
-							return nil
-						}
 						if reachable {
+							// stage was named context
+							if d.namedContext != nil {
+								st, img, err := d.namedContext.Load(ctx)
+								if err != nil {
+									return err
+								}
+								d.dispatched = true
+								d.state = *st
+								if img != nil {
+									// timestamps are inherited as-is, regardless to SOURCE_DATE_EPOCH
+									// https://github.com/moby/buildkit/issues/4614
+									d.image = *img
+									if img.Architecture != "" && img.OS != "" {
+										d.platform = &ocispecs.Platform{
+											OS:           img.OS,
+											Architecture: img.Architecture,
+											Variant:      img.Variant,
+											OSVersion:    img.OSVersion,
+										}
+										if img.OSFeatures != nil {
+											d.platform.OSFeatures = append([]string{}, img.OSFeatures...)
+										}
+									}
+								}
+								return nil
+							}
+
+							// check if base is named context
+							nc, err := namedContext(d.stage.BaseName, dockerui.ContextOpt{
+								ResolveMode:    opt.ImageResolveMode.String(),
+								Platform:       platform,
+								AsyncLocalOpts: d.asyncLocalOpts,
+							})
+							if err != nil {
+								return err
+							}
+							if nc != nil {
+								st, img, err := nc.Load(ctx)
+								if err != nil {
+									return err
+								}
+								if img != nil {
+									d.image = *img
+								} else {
+									d.image = emptyImage(platformOpt.targetPlatform)
+								}
+								d.state = st.Platform(*platform)
+								d.platform = platform
+								return nil
+							}
+
 							prefix := "["
 							if opt.MultiPlatformRequested && platform != nil {
-								prefix += platforms.Format(*platform) + " "
+								prefix += platforms.FormatAll(*platform) + " "
 							}
 							prefix += "internal]"
 							mutRef, dgst, dt, err := metaResolver.ResolveImageConfig(ctx, d.stage.BaseName, sourceresolver.Opt{
@@ -603,8 +625,18 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 		for d := range allReachable {
 			d.init()
 
-			if len(d.image.Config.OnBuild) > 0 {
-				if b, err := initOnBuildTriggers(d, d.image.Config.OnBuild, allDispatchStates); err != nil {
+			onbuilds := slices.Clone(d.image.Config.OnBuild)
+			if d.base != nil && !d.onBuildInit {
+				for _, cmd := range d.base.commands {
+					if obCmd, ok := cmd.Command.(*instructions.OnbuildCommand); ok {
+						onbuilds = append(onbuilds, obCmd.Expression)
+					}
+				}
+				d.onBuildInit = true
+			}
+
+			if len(onbuilds) > 0 {
+				if b, err := initOnBuildTriggers(d, onbuilds, allDispatchStates); err != nil {
 					return nil, parser.SetLocation(err, d.stage.Location)
 				} else if b {
 					newDeps = true
@@ -692,6 +724,7 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 			extraHosts:          opt.ExtraHosts,
 			shmSize:             opt.ShmSize,
 			ulimit:              opt.Ulimits,
+			devices:             opt.Devices,
 			cgroupParent:        opt.CgroupParent,
 			llbCaps:             opt.LLBCaps,
 			sourceMap:           opt.SourceMap,
@@ -769,10 +802,15 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 	target.state = target.state.SetMarshalDefaults(defaults...)
 
 	if !platformOpt.implicitTarget {
+		sameOsArch := platformOpt.targetPlatform.OS == target.image.OS && platformOpt.targetPlatform.Architecture == target.image.Architecture
 		target.image.OS = platformOpt.targetPlatform.OS
 		target.image.Architecture = platformOpt.targetPlatform.Architecture
-		target.image.Variant = platformOpt.targetPlatform.Variant
-		target.image.OSVersion = platformOpt.targetPlatform.OSVersion
+		if platformOpt.targetPlatform.Variant != "" || !sameOsArch {
+			target.image.Variant = platformOpt.targetPlatform.Variant
+		}
+		if platformOpt.targetPlatform.OSVersion != "" || !sameOsArch {
+			target.image.OSVersion = platformOpt.targetPlatform.OSVersion
+		}
 		if platformOpt.targetPlatform.OSFeatures != nil {
 			target.image.OSFeatures = append([]string{}, platformOpt.targetPlatform.OSFeatures...)
 		}
@@ -827,6 +865,7 @@ type dispatchOpt struct {
 	extraHosts          []llb.HostIP
 	shmSize             int64
 	ulimit              []*pb.Ulimit
+	devices             []*pb.CDIDevice
 	cgroupParent        string
 	llbCaps             *apicaps.CapSet
 	sourceMap           *llb.SourceMap
@@ -999,18 +1038,20 @@ func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
 }
 
 type dispatchState struct {
-	opt        dispatchOpt
-	state      llb.State
-	image      dockerspec.DockerOCIImage
-	platform   *ocispecs.Platform
-	stage      instructions.Stage
-	base       *dispatchState
-	baseImg    *dockerspec.DockerOCIImage // immutable, unlike image
-	dispatched bool
-	resolved   bool // resolved is set to true if base image has been resolved
-	deps       map[*dispatchState]instructions.Command
-	buildArgs  []instructions.KeyValuePairOptional
-	commands   []command
+	opt          dispatchOpt
+	state        llb.State
+	image        dockerspec.DockerOCIImage
+	namedContext *dockerui.NamedContext
+	platform     *ocispecs.Platform
+	stage        instructions.Stage
+	base         *dispatchState
+	baseImg      *dockerspec.DockerOCIImage // immutable, unlike image
+	dispatched   bool
+	resolved     bool // resolved is set to true if base image has been resolved
+	onBuildInit  bool
+	deps         map[*dispatchState]instructions.Command
+	buildArgs    []instructions.KeyValuePairOptional
+	commands     []command
 	// ctxPaths marks the paths this dispatchState uses from the build context.
 	ctxPaths map[string]struct{}
 	// paths marks the paths that are used by this dispatchState.
@@ -1050,6 +1091,8 @@ func (ds *dispatchState) init() {
 	ds.state = ds.base.state
 	ds.platform = ds.base.platform
 	ds.image = clone(ds.base.image)
+	// onbuild triggers to not carry over from base stage
+	ds.image.Config.OnBuild = nil
 	ds.baseImg = cloneX(ds.base.baseImg)
 	// Utilize the same path index as our base image so we propagate
 	// the paths we use back to the base image.
@@ -1267,6 +1310,23 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 		}
 	}
 
+	if dopt.llbCaps != nil && dopt.llbCaps.Supports(pb.CapExecMetaCDI) == nil {
+		for _, device := range dopt.devices {
+			deviceOpts := []llb.CDIDeviceOption{
+				llb.CDIDeviceName(device.Name),
+			}
+			if device.Optional {
+				deviceOpts = append(deviceOpts, llb.CDIDeviceOptional)
+			}
+			opt = append(opt, llb.AddCDIDevice(deviceOpts...))
+		}
+		runDevices, err := dispatchRunDevices(c)
+		if err != nil {
+			return err
+		}
+		opt = append(opt, runDevices...)
+	}
+
 	shlex := *dopt.shlex
 	shlex.RawQuotes = true
 	shlex.SkipUnsetEnv = true
@@ -1372,22 +1432,25 @@ func dispatchCopy(d *dispatchState, cfg copyConfig) error {
 		copyOpt = append(copyOpt, llb.WithExcludePatterns(cfg.excludePatterns))
 	}
 
-	var mode *llb.ChmodOpt
+	var chopt *llb.ChmodOpt
 	if cfg.chmod != "" {
-		mode = &llb.ChmodOpt{}
+		chopt = &llb.ChmodOpt{}
 		p, err := strconv.ParseUint(cfg.chmod, 8, 32)
 		nonOctalErr := errors.Errorf("invalid chmod parameter: '%v'. it should be octal string and between 0 and 07777", cfg.chmod)
 		if err == nil {
 			if p > 0o7777 {
 				return nonOctalErr
 			}
-			mode.Mode = os.FileMode(p)
+			chopt.Mode = os.FileMode(p)
 		} else {
-			if featureCopyChmodNonOctalEnabled {
-				mode.ModeStr = cfg.chmod
-			} else {
-				return nonOctalErr
+			if _, err := mode.Parse(cfg.chmod); err != nil {
+				var ne *strconv.NumError
+				if errors.As(err, &ne) {
+					return nonOctalErr // return nonOctalErr for compatibility if the value looks numeric
+				}
+				return err
 			}
+			chopt.ModeStr = cfg.chmod
 		}
 	}
 
@@ -1449,7 +1512,7 @@ func dispatchCopy(d *dispatchState, cfg copyConfig) error {
 			}
 			st := llb.Git(gitRef.Remote, commit, gitOptions...)
 			opts := append([]llb.CopyOption{&llb.CopyInfo{
-				Mode:           mode,
+				Mode:           chopt,
 				CreateDestPath: true,
 			}}, copyOpt...)
 			if a == nil {
@@ -1478,7 +1541,7 @@ func dispatchCopy(d *dispatchState, cfg copyConfig) error {
 			st := llb.HTTP(src, llb.Filename(f), llb.WithCustomName(pgName), llb.Checksum(cfg.checksum), dfCmd(cfg.params))
 
 			opts := append([]llb.CopyOption{&llb.CopyInfo{
-				Mode:           mode,
+				Mode:           chopt,
 				CreateDestPath: true,
 			}}, copyOpt...)
 
@@ -1514,7 +1577,7 @@ func dispatchCopy(d *dispatchState, cfg copyConfig) error {
 			}
 
 			opts := append([]llb.CopyOption{&llb.CopyInfo{
-				Mode:                mode,
+				Mode:                chopt,
 				FollowSymlinks:      true,
 				CopyDirContentsOnly: true,
 				IncludePatterns:     patterns,
@@ -1547,7 +1610,7 @@ func dispatchCopy(d *dispatchState, cfg copyConfig) error {
 		)
 
 		opts := append([]llb.CopyOption{&llb.CopyInfo{
-			Mode:           mode,
+			Mode:           chopt,
 			CreateDestPath: true,
 		}}, copyOpt...)
 
@@ -1863,12 +1926,18 @@ func dfCmd(cmd interface{}) llb.ConstraintsOpt {
 
 func runCommandString(args []string, buildArgs []instructions.KeyValuePairOptional, env shell.EnvGetter) string {
 	var tmpBuildEnv []string
+	tmpIdx := map[string]int{}
 	for _, arg := range buildArgs {
 		v, ok := env.Get(arg.Key)
 		if !ok {
 			v = arg.ValueString()
 		}
-		tmpBuildEnv = append(tmpBuildEnv, arg.Key+"="+v)
+		if idx, ok := tmpIdx[arg.Key]; ok {
+			tmpBuildEnv[idx] = arg.Key + "=" + v
+		} else {
+			tmpIdx[arg.Key] = len(tmpBuildEnv)
+			tmpBuildEnv = append(tmpBuildEnv, arg.Key+"="+v)
+		}
 	}
 	if len(tmpBuildEnv) > 0 {
 		tmpBuildEnv = append([]string{fmt.Sprintf("|%d", len(tmpBuildEnv))}, tmpBuildEnv...)
@@ -2078,7 +2147,7 @@ func prefixCommand(ds *dispatchState, str string, prefixPlatform bool, platform 
 	}
 	out := "["
 	if prefixPlatform && platform != nil {
-		out += platforms.Format(*platform) + formatTargetPlatform(*platform, platformFromEnv(env)) + " "
+		out += platforms.FormatAll(*platform) + formatTargetPlatform(*platform, platformFromEnv(env)) + " "
 	}
 	if ds.stageName != "" {
 		out += ds.stageName + " "
@@ -2112,7 +2181,7 @@ func formatTargetPlatform(base ocispecs.Platform, target *ocispecs.Platform) str
 		return "->" + archVariant
 	}
 	if p.OS != base.OS {
-		return "->" + platforms.Format(p)
+		return "->" + platforms.FormatAll(p)
 	}
 	return ""
 }
@@ -2459,8 +2528,8 @@ func wrapSuggestAny(err error, keys map[string]struct{}, options []string) error
 
 func validateBaseImagePlatform(name string, expected, actual ocispecs.Platform, location []parser.Range, lint *linter.Linter) {
 	if expected.OS != actual.OS || expected.Architecture != actual.Architecture {
-		expectedStr := platforms.Format(platforms.Normalize(expected))
-		actualStr := platforms.Format(platforms.Normalize(actual))
+		expectedStr := platforms.FormatAll(platforms.Normalize(expected))
+		actualStr := platforms.FormatAll(platforms.Normalize(actual))
 		msg := linter.RuleInvalidBaseImagePlatform.Format(name, expectedStr, actualStr)
 		lint.Run(&linter.RuleInvalidBaseImagePlatform, location, msg)
 	}

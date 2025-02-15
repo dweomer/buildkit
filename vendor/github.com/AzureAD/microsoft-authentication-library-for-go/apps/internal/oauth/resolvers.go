@@ -18,9 +18,6 @@ import (
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/oauth/ops/authority"
 )
 
-// ADFS is an active directory federation service authority type.
-const ADFS = "ADFS"
-
 type cacheEntry struct {
 	Endpoints             authority.Endpoints
 	ValidForDomainsInList map[string]bool
@@ -46,15 +43,12 @@ func newAuthorityEndpoint(rest *ops.REST) *authorityEndpoint {
 
 // ResolveEndpoints gets the authorization and token endpoints and creates an AuthorityEndpoints instance
 func (m *authorityEndpoint) ResolveEndpoints(ctx context.Context, authorityInfo authority.Info, userPrincipalName string) (authority.Endpoints, error) {
-	if authorityInfo.AuthorityType == ADFS && len(userPrincipalName) == 0 {
-		return authority.Endpoints{}, errors.New("UPN required for authority validation for ADFS")
-	}
 
 	if endpoints, found := m.cachedEndpoints(authorityInfo, userPrincipalName); found {
 		return endpoints, nil
 	}
 
-	endpoint, err := m.openIDConfigurationEndpoint(ctx, authorityInfo, userPrincipalName)
+	endpoint, err := m.openIDConfigurationEndpoint(ctx, authorityInfo)
 	if err != nil {
 		return authority.Endpoints{}, err
 	}
@@ -86,7 +80,7 @@ func (m *authorityEndpoint) cachedEndpoints(authorityInfo authority.Info, userPr
 	defer m.mu.Unlock()
 
 	if cacheEntry, ok := m.cache[authorityInfo.CanonicalAuthorityURI]; ok {
-		if authorityInfo.AuthorityType == ADFS {
+		if authorityInfo.AuthorityType == authority.ADFS {
 			domain, err := adfsDomainFromUpn(userPrincipalName)
 			if err == nil {
 				if _, ok := cacheEntry.ValidForDomainsInList[domain]; ok {
@@ -105,7 +99,7 @@ func (m *authorityEndpoint) addCachedEndpoints(authorityInfo authority.Info, use
 
 	updatedCacheEntry := createcacheEntry(endpoints)
 
-	if authorityInfo.AuthorityType == ADFS {
+	if authorityInfo.AuthorityType == authority.ADFS {
 		// Since we're here, we've made a call to the backend.  We want to ensure we're caching
 		// the latest values from the server.
 		if cacheEntry, ok := m.cache[authorityInfo.CanonicalAuthorityURI]; ok {
@@ -122,9 +116,12 @@ func (m *authorityEndpoint) addCachedEndpoints(authorityInfo authority.Info, use
 	m.cache[authorityInfo.CanonicalAuthorityURI] = updatedCacheEntry
 }
 
-func (m *authorityEndpoint) openIDConfigurationEndpoint(ctx context.Context, authorityInfo authority.Info, userPrincipalName string) (string, error) {
-	if authorityInfo.Tenant == "adfs" {
+func (m *authorityEndpoint) openIDConfigurationEndpoint(ctx context.Context, authorityInfo authority.Info) (string, error) {
+	if authorityInfo.AuthorityType == authority.ADFS {
 		return fmt.Sprintf("https://%s/adfs/.well-known/openid-configuration", authorityInfo.Host), nil
+	} else if authorityInfo.AuthorityType == authority.DSTS {
+		return fmt.Sprintf("https://%s/dstsv2/%s/v2.0/.well-known/openid-configuration", authorityInfo.Host, authority.DSTSTenant), nil
+
 	} else if authorityInfo.ValidateAuthority && !authority.TrustedHost(authorityInfo.Host) {
 		resp, err := m.rest.Authority().AADInstanceDiscovery(ctx, authorityInfo)
 		if err != nil {
@@ -137,7 +134,6 @@ func (m *authorityEndpoint) openIDConfigurationEndpoint(ctx context.Context, aut
 			return "", err
 		}
 		return resp.TenantDiscoveryEndpoint, nil
-
 	}
 
 	return authorityInfo.CanonicalAuthorityURI + "v2.0/.well-known/openid-configuration", nil
